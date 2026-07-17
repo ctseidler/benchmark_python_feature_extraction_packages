@@ -1,0 +1,22 @@
+[project]
+name = "ts-feature-extraction-benchmark"
+version = "0.1.0"
+description = "Benchmark of Python packages for automatic time-series feature extraction for manufacturing condition monitoring."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Christian Seidler", email = "christian.seidler@ipa.fraunhofer.de" }]
+# The Python version is chosen per virtual environment (see requirements/*.txt and
+# scripts/setup_envs.{ps1,sh}):
+#   - kats:    Python 3.7
+#   - all other packages + the benchmark: Python 3.12
+# Dependencies are intentionally NOT declared here so that each isolated .venv
+# (one per package) only installs what it needs via requirements/<name>.txt.
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

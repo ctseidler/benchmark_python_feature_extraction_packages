@@ -1,0 +1,14 @@
+/data
+__pycache__
+.pytest_cache
+.venvs/
+*.egg-info/
+
+# Results: keep small aggregated CSVs + ranking tables for reproducibility
+# (results/03_* and results/12_*), but exclude large raw extraction outputs and
+# TPOT checkpoint folders.
+results/01_Feature_Extraction_Runs/
+results/02_Extracted_Features/
+results/03_Extracted_Features_Aggregated_Files/
+results/11_Performance_Benchmarks/
+results/12_Rankings/

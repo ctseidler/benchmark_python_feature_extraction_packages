@@ -1,0 +1,29 @@
+[benchmark_settings]
+dataset = "Condition_Monitoring_of_hydraulic_systems"
+data_dir = "data/condition_monitoring_of_hydraulic_systems/"
+export_dir = "results/01_Feature_Extraction_Runs/condition_monitoring_of_hydraulic_systems/"
+packages = ["tsfresh"]
+sampling_interval = 0.5 # in seconds
+num_trials = 3 # Number of trials to run for each package
+
+# Individual package settings
+[tsfresh]
+default_fc_parameters = "efficient" # Valid options: [comprehensive, efficient, minimal]
+n_jobs = 0 # Valid options: [none, 0, 1, 2, ..., n], none means using all available threads
+
+[tsfel]
+domain = "none" # Valid options: [none, statistical, temporal, spectral]
+n_jobs = 60 # Valid options: [1, 2, ..., n]
+
+[pycatch22]
+catch24 = "False" # Valid options: [True, False]
+
+[seglearn]
+features_to_extract = "all" # Valid options: [default, all]
+
+[tsfeatures]
+threads = 60 # Valid options: [none, 1, 2, ..., n], none means using all available threads
+
+# Note: Kats requires python == 3.7
+[kats]
+selected_features = "none"

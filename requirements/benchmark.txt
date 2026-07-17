@@ -1,0 +1,7 @@
+-r base.txt
+# Performance-evaluation environment: TPOT AutoML + fixed-classifier baselines
+# (Random Forest, XGBoost, Logistic Regression, SVM) + statistical analysis.
+tpot>=0.12
+xgboost>=2.0
+scikit-posthocs>=0.7
+aeon>=0.7

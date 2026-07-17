@@ -1,0 +1,10 @@
+-r base.txt
+tsfresh==0.21.0
+# tsfresh depends on stumpy>=1.7.2 (no upper bound). Left unconstrained, the
+# resolver can pick an old stumpy that pulls in numba/llvmlite versions which
+# do NOT support Python 3.12 (e.g. stumpy 1.10.2 -> numba 0.53.1 -> llvmlite
+# 0.36.0, which requires Python <3.10). Pin both to versions that support 3.12:
+#   - numba 0.59.0 is the first release with CPython 3.12 support.
+#   - stumpy 1.13.0 is compatible with numba>=0.57 and runs on 3.12.
+numba>=0.59.0
+stumpy>=1.13.0

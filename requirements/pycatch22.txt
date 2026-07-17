@@ -1,0 +1,6 @@
+-r base.txt
+# pycatch22==0.4.5 ships prebuilt wheels only for CPython 3.10 (Windows + macOS);
+# there is no cp312 wheel, so on Python 3.12 it would build from source and require
+# a C compiler (MSVC on Windows). This environment therefore uses Python 3.10
+# (see scripts/setup_envs.{ps1,sh}), which installs the prebuilt wheel directly.
+pycatch22==0.4.5

@@ -1,0 +1,2 @@
+-r base.txt
+seglearn==1.2.5

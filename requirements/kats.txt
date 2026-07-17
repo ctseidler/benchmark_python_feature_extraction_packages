@@ -1,0 +1,5 @@
+-r base.txt
+# Kats requires Python 3.7 (see scripts/setup_envs.{ps1,sh} which create this
+# environment with --python 3.7). If uv cannot fetch a managed CPython 3.7,
+# point it at a system interpreter: uv venv .venvs/kats --python /path/to/python3.7
+kats==0.2.0

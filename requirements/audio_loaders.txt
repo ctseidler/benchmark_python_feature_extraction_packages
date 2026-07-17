@@ -1,0 +1,9 @@
+# Optional: only required for the IDMT-ISA-Compressed-Air and MIMII audio datasets
+# (NOT part of the four datasets used in the paper). The audio loaders are imported
+# lazily by src/base.py, so these are NOT needed for the four paper datasets.
+#
+# To install into a package venv on demand:
+#   uv pip install -r requirements/audio_loaders.txt --python .venvs/<name>
+
+librosa>=0.10
+soundfile>=0.12
