@@ -30,6 +30,9 @@ decimal=``","``) — the single input for all downstream ranking analyses.
 
 Replaces the stale ``AutoML_results.csv`` / ``AutoML_results_2.csv`` which held
 the pre-leakage-fix results.
+
+Created on: 09-07-2026
+by Christian Seidler <christian.seidler@ipa.fraunhofer.de>
 """
 
 from __future__ import annotations

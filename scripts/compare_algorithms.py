@@ -3,7 +3,9 @@
 Compare ML algorithms across datasets using:
 
 - Nonparametric (Demšar-style): Friedman (Iman–Davenport) + post-hoc
-- Mixed-effects model on raw scores: algorithm fixed effect, dataset random intercept
+- Mixed-effects model on raw scores: algorithm fixed effect, with nested random
+  intercepts (1|dataset) + (1|dataset:seed) so the shared train/test split of
+  each repeated run is modeled separately from residual variation
 
 Usage:
     python compare_algorithms.py master_table.csv --mode mixed --direction higher --alpha 0.05
@@ -15,6 +17,8 @@ CSV columns (long form, required):
 - dataset: dataset identifier
 - algorithm: algorithm identifier (feature-extraction package/config)
 - run: run index (repeat number)
+- seed: random seed for the run (shared across all algorithms in that run; the
+  dataset:seed combination defines the train/test split block)
 - classifier: classifier identifier (tpot, random_forest, xgboost, logreg, svm)
 - <score-col>: performance metric (default balanced_accuracy; also accuracy, f1_score)
 
@@ -26,8 +30,15 @@ Notes:
 
 - Mixed-effects model uses raw scores (not aggregated).
 - If direction='lower', scores are multiplied by -1 so "higher is better".
+- Mixed-model random structure: (1|dataset) + (1|dataset:seed). The
+  dataset:seed block separates the variation due to the particular train/test
+  split (shared by all algorithms evaluated under the same seed) from the
+  residual variation between feature-extraction configurations. If the input
+  lacks both 'seed' and 'run' columns, the model falls back to a dataset-only
+  random intercept (with a warning).
 
-- Global test for mixed model is LRT (ML fit) comparing full vs null (no algorithm effect).
+- Global test for mixed model is a joint Wald test on the algorithm dummies
+  (the LRT helper is provided but currently unused; both use the nested RE).
 - Pairwise contrasts use fixed-effects covariance (normal approx) with Holm correction.
 
 """
@@ -40,26 +51,29 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import stats
-from statsmodels.regression.mixed_linear_model import MixedLM
 
-# Optional imports (each is a heavy/optional dep; fall back to None and the code
-# branches on availability). The per-line ignores are the standard pattern for
-# optional imports: the None assignment is intentional on the fallback branch.
+# Optional imports
+
 try:
     from statsmodels.stats.multitest import multipletests
 except Exception:
-    multipletests = None  # type: ignore
+    multipletests = None
 
 try:
     # SciPy >= 1.9 has the studentized range distribution
     from scipy.stats import studentized_range
 except Exception:
-    studentized_range = None  # type: ignore
+    studentized_range = None
 
 try:
-    import scikit_posthocs as sp  # type: ignore
+    import scikit_posthocs as sp
 except Exception:
     sp = None
+
+# Statsmodels for mixed effects and OLS fallback
+
+import statsmodels.api as sm
+from statsmodels.regression.mixed_linear_model import MixedLM
 
 
 def print_table(df, title=None):
@@ -151,7 +165,7 @@ def pairwise_holm_on_ranks(avg_ranks, N, k, alpha=0.05):
         z = diff / SE
         p = 2.0 * stats.norm.sf(z)
         pairs.append((a, b, diff, z, p))
-    df = pd.DataFrame(pairs, columns=pd.Index(["alg1", "alg2", "rank_diff", "z", "p"]))
+    df = pd.DataFrame(pairs, columns=["alg1", "alg2", "rank_diff", "z", "p"])
     if multipletests is not None:
         _, p_adj, _, _ = multipletests(df["p"].values, alpha=alpha, method="holm")
     else:
@@ -210,13 +224,100 @@ def conover_posthoc(agg_df, alpha=0.05):
 
 # -------------------------
 
+# Random structure used for all mixed-effects fits in this script.
+#
+# Each of the 5 repeated runs uses a different random seed and therefore a
+# different train/test split, while every feature-extraction configuration
+# evaluated under the same seed shares that split. Scores are thus paired
+# within each (dataset, seed) combination: an easier or harder split moves
+# several configurations together. To separate the variation caused by the
+# particular split from the residual variation between configurations, the
+# model uses two nested random intercepts:
+#
+#     score ~ C(algorithm) + (1 | dataset) + (1 | dataset:seed)
+#
+# * (1 | dataset)         - between-dataset mean differences.
+# * (1 | dataset:seed)    - the shared split effect, nested within dataset.
+#
+# In statsmodels this is expressed as:
+#   groups="dataset_seed", re_formula="1"               -> (1 | dataset:seed)
+#   vc_formula={"dataset": "0 + C(dataset)"}            -> (1 | dataset)
+#
+# If a future input table lacks both ``seed`` and ``run`` columns, the helper
+# falls back to the original dataset-only grouping (with a warning), so the
+# script remains usable on legacy inputs.
+
+SPLIT_BLOCK_COL = "dataset_seed"
+
+
+def _add_split_block(data):
+    """Add the nested-split grouping column ``dataset_seed`` to ``data``.
+
+    Builds a ``dataset:seed`` block identifier. Prefers ``seed`` (matching the
+    reviewer's "dataset-seed combination" wording); falls back to ``run`` if
+    ``seed`` is absent; falls back to ``dataset`` itself (no split block) if
+    neither is available, in which case the model collapses to the original
+    dataset-only random intercept and a warning is printed.
+    """
+    data = data.copy()
+    if "seed" in data.columns and not data["seed"].isna().all():
+        data[SPLIT_BLOCK_COL] = data["dataset"].astype(str) + "__" + data["seed"].astype(str)
+    elif "run" in data.columns and not data["run"].isna().all():
+        data[SPLIT_BLOCK_COL] = data["dataset"].astype(str) + "__" + data["run"].astype(str)
+    else:
+        print(
+            "  WARNING: no 'seed'/'run' column found; falling back to dataset-only "
+            "random intercept (within-split dependence will NOT be modeled)."
+        )
+        data[SPLIT_BLOCK_COL] = data["dataset"].astype(str)
+    return data
+
+
+def _fit_nested_mixed(data, formula="score ~ C(algorithm)", reml=True):
+    """Fit the nested random-intercept MixedLM and return the result.
+
+    Model: ``formula`` with random intercepts (1|dataset) + (1|dataset:seed).
+    ``data`` must already contain the ``dataset_seed`` column (see
+    :func:`_add_split_block`) and have ``dataset`` as a categorical.
+
+    If the fully nested fit fails to converge or yields a non-finite
+    log-likelihood, it falls back to a simpler model that keeps the split block
+    (``groups="dataset_seed"``) but drops the separate dataset-level variance
+    component. This still accounts for within-split dependence; it just no
+    longer partitions the dataset level from the split level.
+    """
+    vc = {"dataset": "0 + C(dataset)"}
+    try:
+        model = MixedLM.from_formula(
+            formula,
+            groups=SPLIT_BLOCK_COL,
+            re_formula="1",
+            vc_formula=vc,
+            data=data,
+        )
+        res = model.fit(method="lbfgs", reml=reml)
+        if not np.isfinite(res.llf):
+            raise RuntimeError("non-finite log-likelihood")
+        return res
+    except Exception as e:
+        print(
+            f"  WARNING: nested (1|dataset)+(1|dataset:seed) fit failed ({e}); "
+            "falling back to split-block-only (1|dataset:seed) random intercept."
+        )
+        model = MixedLM.from_formula(formula, groups=SPLIT_BLOCK_COL, re_formula="1", data=data)
+        return model.fit(method="lbfgs", reml=reml)
+
 
 def mixed_global_lrt(df, direction="higher"):
     """
     Global likelihood-ratio test for algorithm effect in MixedLM:
 
-    - Full: score ~ C(algorithm) + (1|dataset)
-    - Null: score ~ 1 + (1|dataset)
+    - Full: score ~ C(algorithm) + (1|dataset) + (1|dataset:seed)
+    - Null: score ~ 1 + (1|dataset) + (1|dataset:seed)
+
+    The dataset:seed random intercept models the shared train/test split of
+    each repeated run, separating split-level variation from residual variation
+    between feature-extraction configurations (Reviewer #1).
 
     Fit with ML (reml=False) for valid LRT.
     Returns: dict with llf_full, llf_null, LR, df, pvalue, k_alg
@@ -228,20 +329,17 @@ def mixed_global_lrt(df, direction="higher"):
     # Ensure categorical
     data["algorithm"] = data["algorithm"].astype("category")
     data["dataset"] = data["dataset"].astype("category")
+    data = _add_split_block(data)
 
     # Full model (ML)
     try:
-        full = MixedLM.from_formula(
-            "score ~ C(algorithm)", groups="dataset", re_formula="1", data=data
-        )
-        full_res = full.fit(method="lbfgs", reml=False)
+        full_res = _fit_nested_mixed(data, formula="score ~ C(algorithm)", reml=False)
     except Exception as e:
         raise RuntimeError(f"MixedLM full model failed: {e}")
 
     # Null model (ML)
     try:
-        null = MixedLM.from_formula("score ~ 1", groups="dataset", re_formula="1", data=data)
-        null_res = null.fit(method="lbfgs", reml=False)
+        null_res = _fit_nested_mixed(data, formula="score ~ 1", reml=False)
     except Exception as e:
         raise RuntimeError(f"MixedLM null model failed: {e}")
 
@@ -271,6 +369,9 @@ def mixed_emm_and_pairs(df, direction="higher", alpha=0.05, use_reml=True):
 
     Uses REML by default for estimates; normal approx for p-values.
     Returns (emm_df, pairs_df, model_result)
+
+    Random structure: (1|dataset) + (1|dataset:seed) — the dataset:seed block
+    accounts for the shared train/test split of each repeated run (Reviewer #1).
     """
     data = df.copy()
     if direction == "lower":
@@ -278,11 +379,10 @@ def mixed_emm_and_pairs(df, direction="higher", alpha=0.05, use_reml=True):
 
     data["algorithm"] = data["algorithm"].astype("category")
     data["dataset"] = data["dataset"].astype("category")
+    data = _add_split_block(data)
 
     try:
-        res = MixedLM.from_formula(
-            "score ~ C(algorithm)", groups="dataset", re_formula="1", data=data
-        ).fit(method="lbfgs", reml=use_reml)
+        res = _fit_nested_mixed(data, formula="score ~ C(algorithm)", reml=use_reml)
     except Exception as e:
         raise RuntimeError(f"MixedLM fit failed: {e}")
 
@@ -317,9 +417,9 @@ def mixed_emm_and_pairs(df, direction="higher", alpha=0.05, use_reml=True):
         ci_lo = est - zcrit * se
         ci_hi = est + zcrit * se
         rows.append((a, est, se, ci_lo, ci_hi))
-    emm_df = pd.DataFrame(
-        rows, columns=pd.Index(["algorithm", "emm", "se", "ci_lo", "ci_hi"])
-    ).sort_values("emm", ascending=False)
+    emm_df = pd.DataFrame(rows, columns=["algorithm", "emm", "se", "ci_lo", "ci_hi"]).sort_values(
+        "emm", ascending=False
+    )
 
     # Pairwise contrasts
     pairs = []
@@ -333,7 +433,7 @@ def mixed_emm_and_pairs(df, direction="higher", alpha=0.05, use_reml=True):
         z = diff / se if se > 0 else np.nan
         p = 2.0 * stats.norm.sf(abs(z)) if np.isfinite(z) else np.nan
         pairs.append((a, b, diff, se, z, p))
-    pairs_df = pd.DataFrame(pairs, columns=pd.Index(["alg1", "alg2", "diff", "se", "z", "p"]))
+    pairs_df = pd.DataFrame(pairs, columns=["alg1", "alg2", "diff", "se", "z", "p"])
 
     # Holm adjustment
     pvals = pairs_df["p"].values
@@ -380,8 +480,7 @@ def _enforce_complete_blocks(df):
     complete_algs = pivot.columns[~missing.any(axis=0)].tolist()
     dropped = sorted(set(pivot.columns) - set(complete_algs))
     print(
-        "  NOTE: dropping algorithms not present in all datasets "
-        f"(complete-block design): {dropped}"
+        f"  NOTE: dropping algorithms not present in all datasets (complete-block design): {dropped}"
     )
     return df[df["algorithm"].isin(complete_algs)].copy()
 
@@ -396,10 +495,19 @@ def run_analysis(df, args, classifier_label):
 
     n_datasets = df["dataset"].nunique()
     n_algs = df["algorithm"].nunique()
+    has_seed = "seed" in df.columns and not df["seed"].isna().all()
+    has_run = "run" in df.columns and not df["run"].isna().all()
+    if has_seed or has_run:
+        block = "seed" if has_seed else "run"
+        n_blocks = df.groupby(["dataset", block]).ngroups
+        re_desc = f"random intercepts: (1|dataset) + (1|dataset:{block}); {n_blocks} split blocks"
+    else:
+        re_desc = "random intercept: (1|dataset) only (no seed/run column found)"
     print(
         f"\nDesign summary: datasets={n_datasets}, algorithms={n_algs}, "
         f"runs per dataset×algorithm (variable), direction='{args.direction}'."
     )
+    print(f"Mixed-effects random structure: {re_desc}.")
 
     # -----------------
     # Nonparametric path
@@ -424,10 +532,7 @@ def run_analysis(df, args, classifier_label):
 
         fr = friedman_iman_davenport(ranks_df)
         print(
-            "\nNonparametric global (Friedman Iman–Davenport): "
-            f"F={fr['F']:.4f}, df1={fr['k'] - 1}, "
-            f"df2={(fr['k'] - 1) * (fr['N'] - 1)}, "
-            f"p-value={fr['pvalue']:.6f}"
+            f"\nNonparametric global (Friedman Iman–Davenport): F={fr['F']:.4f}, df1={fr['k'] - 1}, df2={(fr['k'] - 1) * (fr['N'] - 1)}, p-value={fr['pvalue']:.6f}"
         )
 
         if fr["pvalue"] < args.alpha:
@@ -439,8 +544,7 @@ def run_analysis(df, args, classifier_label):
                 con_df = conover_posthoc(agg_df, alpha=args.alpha)
                 if con_df is None:
                     print(
-                        "Conover post-hoc not available; falling back to "
-                        "Holm-adjusted pairwise z-tests."
+                        "Conover post-hoc not available; falling back to Holm-adjusted pairwise z-tests."
                     )
                     method = "holm"
                 else:
@@ -460,8 +564,7 @@ def run_analysis(df, args, classifier_label):
                         )
                     else:
                         print(
-                            "\nNo significant pairwise differences at "
-                            f"alpha={args.alpha} (Conover+Holm)."
+                            f"\nNo significant pairwise differences at alpha={args.alpha} (Conover+Holm)."
                         )
             if method == "holm":
                 pair_df = pairwise_holm_on_ranks(avg_ranks, N, k, alpha=args.alpha)
@@ -473,8 +576,7 @@ def run_analysis(df, args, classifier_label):
                     )
                 else:
                     print(
-                        "\nNo significant pairwise differences at "
-                        f"alpha={args.alpha} (Holm-adjusted)."
+                        f"\nNo significant pairwise differences at alpha={args.alpha} (Holm-adjusted)."
                     )
             if method == "nemenyi":
                 CD = nemenyi_cd(N, k, alpha=args.alpha)
@@ -490,29 +592,35 @@ def run_analysis(df, args, classifier_label):
                         )
                         for a, b in combinations(algs, 2)
                     ],
-                    columns=pd.Index(["alg1", "alg2", "rank_diff", "diff_exceeds_CD"]),
+                    columns=["alg1", "alg2", "rank_diff", "diff_exceeds_CD"],
                 ).sort_values(["diff_exceeds_CD", "rank_diff"], ascending=[False, False])
                 print_table(nd, title="Pairs and Nemenyi CD exceedance")
         else:
             print(
-                "\nNonparametric global test not significant at "
-                f"alpha={args.alpha}; post-hoc comparisons typically "
-                "not pursued."
+                f"\nNonparametric global test not significant at alpha={args.alpha}; post-hoc comparisons typically not pursued."
             )
 
     # ----------------
     # Mixed-effects path
     # ----------------
     if args.mode in ("mixed", "both"):
+        # Global LRT on ML fits
+        # try:
+        #     lrt = mixed_global_lrt(df, direction=args.direction)
+        #     print(
+        #         f"\nMixed-effects global LRT (algorithm effect): LR={lrt['LR']:.4f}, df={lrt['df']}, p-value={lrt['pvalue']:.6f} (ML fit)"
+        #     )
+        # except RuntimeError as e:
+        #     print(f"\nMixed-effects global LRT failed: {e}")
+        #     return
         data = df.copy()
         if args.direction == "lower":
             data["score"] = -data["score"]
         data["algorithm"] = data["algorithm"].astype("category")
         data["dataset"] = data["dataset"].astype("category")
+        data = _add_split_block(data)
 
-        res = MixedLM.from_formula(
-            "score ~ C(algorithm)", groups="dataset", re_formula="1", data=data
-        ).fit()
+        res = _fit_nested_mixed(data, formula="score ~ C(algorithm)", reml=True)
 
         # Joint Wald test: all algorithm dummies = 0
 
@@ -556,17 +664,98 @@ def run_analysis(df, args, classifier_label):
             print(f"\nNo significant mixed-effects pairwise differences at alpha={args.alpha}.")
 
         # Optional: print variance components
+        #
+        # The nested model has up to three variance components:
+        #   dataset_sd      = sqrt(vcomp[0])            -> (1|dataset)
+        #   dataset_seed_sd = sqrt(cov_re.iloc[0,0])    -> (1|dataset:seed)
+        #   residual_sd     = sqrt(scale)               -> epsilon
+        #
+        # With only 4 datasets, the split between dataset_sd and
+        # dataset_seed_sd is weakly identified (confirmed empirically by
+        # refitting with multiple optimizers: lbfgs/bfgs/cg sometimes put all
+        # the between-block variance on dataset_seed_sd -- i.e. dataset_sd at
+        # the zero boundary -- and sometimes split it ~evenly between the two
+        # components). Their SUM, however, is stable across optimizers and
+        # fitting strategies. We therefore compute and report a single
+        # combined between-block SD, block_sd = sqrt(dataset_var +
+        # dataset_seed_var), together with block_sd/residual_sd-based ICC.
+        # This is the quantity that matters for Reviewer #1's concern
+        # (separating split/dataset structure from genuine residual noise
+        # between configurations) and avoids reporting an unstable
+        # decomposition.
         try:
+            # Dataset-level variance (vc_formula component); NaN if the
+            # nested fit failed and the script fell back to a single-level
+            # (1|dataset:seed) model (see _fit_nested_mixed).
+            try:
+                ds_var = float(res_reml.vcomp[0]) if len(res_reml.vcomp) else float("nan")
+            except Exception:
+                ds_var = float("nan")
+            ds_sd = np.sqrt(ds_var) if np.isfinite(ds_var) and ds_var >= 0 else float("nan")
+
+            # Split-block (dataset:seed) variance -- always available, either
+            # from the nested fit or from the single-level fallback fit (in
+            # which case it already represents the full between-block
+            # variance, see note below).
+            try:
+                ds_seed_var = max(float(res_reml.cov_re.iloc[0, 0]), 0.0)
+            except Exception:
+                ds_seed_var = float("nan")
+            ds_seed_sd = np.sqrt(ds_seed_var) if np.isfinite(ds_seed_var) else float("nan")
+
+            # Residual
+            try:
+                resid_var = float(res_reml.scale)
+                resid_sd = resid_var**0.5
+            except Exception:
+                resid_var = float("nan")
+                resid_sd = float("nan")
+
+            # Combined between-block variance.
+            # - Normal case (nested fit succeeded): ds_var is finite, so
+            #   block_var = ds_var + ds_seed_var.
+            # - Fallback case (nested fit failed -> single-level
+            #   (1|dataset:seed) model): ds_var is NaN because there is no
+            #   separate dataset-level component in that model; the fitted
+            #   dataset_seed_sd already absorbs the full between-block
+            #   variance, so block_var = ds_seed_var directly.
+            if np.isfinite(ds_var):
+                block_var = ds_var + ds_seed_var
+            else:
+                block_var = ds_seed_var
+            block_sd = np.sqrt(block_var) if np.isfinite(block_var) else float("nan")
+
+            icc = (
+                block_var / (block_var + resid_var)
+                if np.isfinite(block_var) and np.isfinite(resid_var) and (block_var + resid_var) > 0
+                else float("nan")
+            )
+
             var_comp = pd.DataFrame(
-                {
-                    "component": ["dataset_sd", "residual_sd"],
-                    "estimate": [
-                        np.sqrt(float(res_reml.cov_re.iloc[0, 0])),
-                        float(res_reml.scale) ** 0.5,
-                    ],
-                }
+                [
+                    ("dataset_sd", ds_sd),
+                    ("dataset_seed_sd", ds_seed_sd),
+                    ("block_sd (combined dataset+dataset:seed)", block_sd),
+                    ("residual_sd", resid_sd),
+                    ("ICC (block_var / (block_var+residual_var))", icc),
+                ],
+                columns=["component", "estimate"],
             )
             print_table(var_comp, title="Mixed-effects variance components (REML)")
+
+            if not np.isfinite(ds_var):
+                print(
+                    "  NOTE: nested (1|dataset)+(1|dataset:seed) fit did not converge for "
+                    "this classifier; dataset_sd is not separately identified. block_sd is "
+                    "computed directly from the single-level (1|dataset:seed) fallback fit "
+                    "and represents the full between-block variance."
+                )
+            else:
+                print(
+                    "  NOTE: with only a few datasets, the split between dataset_sd and "
+                    "dataset_seed_sd is weakly identified; report block_sd (their combined "
+                    "contribution) rather than the individual components."
+                )
         except Exception:
             pass
 
@@ -574,16 +763,11 @@ def run_analysis(df, args, classifier_label):
 def main():
     """Parse args, build the summary table, and run the analysis per classifier."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Compare ML algorithms across datasets using nonparametric and/or mixed-effects model."
-        )
+        description="Compare ML algorithms across datasets using nonparametric and/or mixed-effects model."
     )
     parser.add_argument(
         "csv",
-        help=(
-            "Path to CSV master table with columns: dataset, algorithm, "
-            "run, classifier, <score-col>"
-        ),
+        help="Path to CSV master table with columns: dataset, algorithm, run, classifier, <score-col>",
     )
     parser.add_argument(
         "--direction",
@@ -602,10 +786,7 @@ def main():
         "--posthoc",
         choices=["auto", "holm", "conover", "nemenyi"],
         default="auto",
-        help=(
-            "Nonparametric post-hoc: 'holm' (pairwise z + Holm), "
-            "'conover' (requires scikit-posthocs), 'nemenyi' (CD), or 'auto'"
-        ),
+        help="Nonparametric post-hoc: 'holm' (pairwise z + Holm), 'conover' (requires scikit-posthocs), 'nemenyi' (CD), or 'auto'",
     )
     parser.add_argument(
         "--mode",
@@ -623,10 +804,7 @@ def main():
     parser.add_argument(
         "--score-col",
         default="balanced_accuracy",
-        help=(
-            "Column to use as the score (default: balanced_accuracy). "
-            "Also valid: accuracy, f1_score."
-        ),
+        help="Column to use as the score (default: balanced_accuracy). Also valid: accuracy, f1_score.",
     )
     parser.add_argument(
         "--datasets",
