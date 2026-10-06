@@ -1,5 +1,8 @@
 # Benchmarking Feature Extraction Packages
 
+Our Paper has been published as Open-Access 🎉
+<br>**Link:** [Benchmarking Python-Packages for Time Series Feature Extraction on Manufacturing Data](https://doi.org/10.1016/j.eswa.2026.134418)
+
 ## Description
 Performance benchmarking of several Python-packages for automatic feature extraction from time-series.
 
